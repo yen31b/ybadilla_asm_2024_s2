@@ -1,0 +1,60 @@
+// Parámetros PID
+float Kp = 2.0;
+float Ki = 0.5;
+float Kd = 1.0;
+
+// Variables del controlador PID
+float setpoint = 25.0; // Valor deseado
+float input = 0.0;     // Valor actual medido
+float output = 0.0;
+float previousError = 0.0;
+float integral = 0.0;
+
+unsigned long previousTime = 0;
+const unsigned long sampleTime = 100; // Intervalo de muestreo en milisegundos
+
+void setup() {
+  Serial.begin(9600);
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  unsigned long elapsedTime = currentTime - previousTime;
+
+  if (elapsedTime >= sampleTime) {
+    previousTime = currentTime;
+
+    // Leer el valor actual (ej. sensor)
+    input = analogRead(A0);
+
+    // Calcular el error
+    float error = setpoint - input;
+
+    // Control Proporcional
+    float proportional = Kp * error;
+
+    // Control Integral
+    integral += error * (elapsedTime / 1000.0);
+    float integralPart = Ki * integral;
+
+    // Control Derivativo
+    float derivative = (error - previousError) / (elapsedTime / 1000.0);
+    float derivativePart = Kd * derivative;
+
+    // Calcular la salida total
+    output = proportional + integralPart + derivativePart;
+
+    // Limitar la salida al rango de 0 a 255 (ej. salida PWM)
+    output = constrain(output, 0, 255);
+    analogWrite(9, output);
+
+    // Actualizar el error anterior
+    previousError = error;
+
+    // Mostrar resultados para depuración
+    Serial.print("Input: ");
+    Serial.print(input);
+    Serial.print(" Output: ");
+    Serial.println(output);
+  }
+}
