@@ -1,116 +1,130 @@
-"""
-Nivel de un Tanque con Modos Manual y Automático
+from machine import Pin, PWM, ADC, Timer
+import time
+import sys
 
-by: Sergio Andrés Castaño Giraldo (base)
-Adaptación por: ChatGPT
-"""
-
-from machine import Pin, PWM, ADC
-from utime import sleep_ms, ticks_ms
-import math
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-
-# Configuración de PINES
-sensor = ADC(26)
+# Configuración de pines
+#sensor = ADC(26)  # Sensor de presión
 voltaje = ADC(27)
 potenciometro = ADC(28)
-pwm = PWM(Pin(20))
+pwm = PWM(Pin(20)) 
 pwm.freq(40000)
-modo = Pin(15, Pin.IN)  # Interruptor digital para seleccionar modo
 
-# Parámetros para generación de señales
-amplitud = 32767  # Valor máximo para PWM (0 a 65535)
-frecuencia = 0.5  # Frecuencia de la señal (Hz)
-signal_type = 'senoidal'  # Cambia a: 'triangular', 'diente', 'cuadrada' según desees
+out_pin = Pin(3, Pin.IN)  # HX710 OUT conectado a GPIO2
+sck_pin = Pin(2, Pin.OUT)  # HX710 SCK conectado a GPIO3
 
-# Parámetros del sensor MPS20N0040D-HX10B
-Vmin = 0.5  # Voltaje mínimo (0 kPa)
-Vmax = 4.5  # Voltaje máximo (40 kPa)
-Pmax = 40   # Presión máxima (kPa)
-rho = 1000  # Densidad del agua (kg/m^3)
-g = 9.8     # Gravedad (m/s^2)
+# Variables globales
+t = 0
+level = 0
+dt = 1
 
+# Parámetros del sistema
+K = 5
+tau = 350
+theta = 3
+Ts = 10  # Periodo de muestreo
+L = theta + Ts / 2
 
-def generar_senal(tipo, t):
-    """
-    Genera diferentes tipos de señales según el tipo y el tiempo.
-    """
-    if tipo == 'senoidal':
-        return int((math.sin(2 * math.pi * frecuencia * t) + 1) * (amplitud / 2))
-    elif tipo == 'triangular':
-        valor = (t % (1 / frecuencia)) * frecuencia * 2
-        return int(amplitud * (1 - abs(valor - 1)))
-    elif tipo == 'diente':
-        return int((t % (1 / frecuencia)) * frecuencia * amplitud)
-    elif tipo == 'cuadrada':
-        return int(amplitud if (t % (1 / frecuencia)) < (1 / (2 * frecuencia)) else 0)
+e = [0, 0, 0]  # Vector de error
+u = [0, 0]  # Vector de Ley de Control PID
+setpoint = 0
 
+# Parámetros del controlador PID
+kp = (1.2 * tau) / (K * L)
+ti = 2 * L
+td = 0.5 * L
+q0 = kp * (1 + Ts / (2 * ti) + td / Ts)
+q1 = -kp * (1 - Ts / (2 * ti) + (2 * td) / Ts)
+q2 = (kp * td) / Ts
 
-def calcular_presion(sensor_adc):
-    """
-    Calcula la presión en kPa a partir de la lectura ADC del sensor.
-    """
-    factor_16 = 3.3 / (65535)  # Conversión de ADC a voltaje (Raspberry Pi Pico)
-    Vout = sensor_adc.read_u16() * factor_16
-    if Vout < Vmin:
-        Vout = Vmin  # Aseguramos que el voltaje no sea menor al rango del sensor
-    presion = (Vout - Vmin) / (Vmax - Vmin) * Pmax
-    return presion
+# Funciones auxiliares
+def update_past(v, kT):
+    for i in range(1, kT, 1):
+        v[i - 1] = v[i]
+    return v
 
+def PID_Controller(u, e, q0, q1, q2):
+    # Controlador PID
+    lu = u[0] + q0 * e[2] + q1 * e[1] + q2 * e[0]  # Ley de control PID discreto
+    
+    # Anti-windup
+    if lu >= 100.0:
+        lu = 100.0
+    if lu <= 0.0:
+        lu = 0.0
 
-def calcular_nivel(presion):
-    """
-    Calcula el nivel de agua en cm a partir de la presión en kPa.
-    """
-    nivel = (presion * 1000) / (rho * g) * 100  # Conversión de presión a altura (cm)
-    return nivel
+    return lu
 
-
-# --- Código para graficar en la computadora ---
-# Variables globales para la gráfica
-niveles = []
-tiempos = []
-start_time = ticks_ms()
-
-
-def actualizar_grafica(i):
-    global niveles, tiempos, start_time
-
-    # Cálculo de presión y nivel
-    level_sum = 0
-    for _ in range(200):
-        presion = calcular_presion(sensor)
-        nivel = calcular_nivel(presion)
-        level_sum += nivel
-    nivel = level_sum / 200
-
-    # Generar señal o usar potenciómetro
-    tiempo_actual = (ticks_ms() - start_time) / 1000  # Tiempo en segundos
-    velocidad = generar_senal(signal_type, tiempo_actual) if modo.value() == 1 else int(potenciometro.read_u16())
+def temporizador(timer):
+    global u, e, setpoint, level, q0, q1, q2
+    # Actualiza los vectores u y e
+    u = update_past(u, len(u))
+    e = update_past(e, len(e))
+    
+    # Calcula el error actual
+    e[len(e) - 1] = setpoint - level
+    # Calcula la acción de control PID
+    u_end = PID_Controller(u, e, q0, q1, q2)  # Max = 100, Min = 0
+    u[len(u) - 1] = u_end
+    
+    # Aplica la acción de control al PWM
+    velocidad = int(u[len(u) - 1] * 65535 / 100)
     pwm.duty_u16(velocidad)
 
-    # Actualizar datos para graficar
-    niveles.append(nivel)
-    tiempos.append(tiempo_actual)
+def read_hx710():
+    # Espera a que termine la lectura actual
+    while out_pin.value() == 1:
+        pass
 
-    # Mostrar solo los últimos 100 puntos
-    niveles = niveles[-100:]
-    tiempos = tiempos[-100:]
+    # Lee 24 bits
+    result = 0
+    for i in range(24):
+        sck_pin.on()
+        time.sleep_us(1)  # Pequeña demora para estabilizar la señal de reloj
+        sck_pin.off()
+        result = result << 1
+        if out_pin.value():
+            result += 1
 
-    # Actualizar la gráfica
-    ax.clear()
-    ax.plot(tiempos, niveles, label="Nivel del tanque (cm)")
-    ax.set_title("Nivel de agua en el tanque")
-    ax.set_xlabel("Tiempo (s)")
-    ax.set_ylabel("Nivel (cm)")
-    ax.legend()
-    ax.grid()
+    # Convierte a complemento a 2
+    result = result ^ 0x800000
+
+    # Pulsa la línea de reloj 3 veces para iniciar la siguiente lectura
+    for i in range(3):
+        sck_pin.on()
+        time.sleep_us(1)
+        sck_pin.off()
+
+    return result
+
+def read_analog_filtered(adc_pin, samples=10):
+    total = 0
+    for _ in range(samples):
+        total += adc_pin.read_u16()
+        time.sleep_us(100)  # Breve pausa entre lecturas
+    return total // samples
 
 
-# Configuración inicial de matplotlib
-fig, ax = plt.subplots()
-ani = animation.FuncAnimation(fig, actualizar_grafica, interval=500)
+def main():
+    global level, t, setpoint, u, e
 
-# Inicia el programa
-plt.show()
+    tim = Timer()
+    tim.init(period=10000, mode=Timer.PERIODIC, callback=temporizador)
+
+    while True:
+        # Leer presión en la forma correcta, calculando la medida final
+        pressure_raw = read_hx710()
+        level = pressure_raw / 1000  # Ajusta según lo que necesites
+
+        # Leer setpoint del potenciómetro (puedes cambiarlo si necesitas otro tipo de entrada)
+        setpoint = read_analog_filtered(potenciometro) * 18 / (65535)
+
+        # Imprimir los valores en la consola
+        print("Presión medida:", level)
+        print("Setpoint:", setpoint)
+        print("Control PWM:", pwm.duty_u16())
+        
+        # Esperar un poco antes de hacer la siguiente lectura
+        time.sleep(1)
+
+if __name__ == '__main__':
+    main()
